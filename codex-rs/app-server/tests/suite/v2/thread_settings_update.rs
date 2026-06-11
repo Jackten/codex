@@ -5,7 +5,9 @@ use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::write_models_cache;
+use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ThreadListResponse;
@@ -435,6 +437,72 @@ async fn turn_start_settings_override_emits_thread_settings_updated() -> Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn codex_desktop_turn_start_effort_does_not_override_thread_settings() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("done")?,
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    initialize_as_codex_desktop(&mut mcp).await?;
+    let thread = start_thread_with_model(&mut mcp, "gpt-5.3-codex")
+        .await?
+        .thread;
+
+    send_thread_settings_update(
+        &mut mcp,
+        ThreadSettingsUpdateParams {
+            thread_id: thread.id.clone(),
+            effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let updated = read_thread_settings_updated(&mut mcp).await?;
+    assert_eq!(updated.thread_id, thread.id);
+    assert_eq!(updated.thread_settings.effort, Some(ReasoningEffort::High));
+
+    let turn_request_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        })
+        .await?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(turn_request_id)).await??;
+    assert!(!turn.id.is_empty());
+
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let request_bodies = received_response_bodies(&server).await?;
+    assert_eq!(request_bodies.len(), 1);
+    let expected_effort = serde_json::to_value(ReasoningEffort::High)?;
+    assert_eq!(
+        request_bodies[0]
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort")),
+        Some(&expected_effort),
+        "Desktop turn/start effort should not override thread settings: {request_bodies:#?}"
+    );
+    Ok(())
+}
+
 async fn send_thread_settings_update(
     mcp: &mut TestAppServer,
     params: ThreadSettingsUpdateParams,
@@ -462,10 +530,31 @@ async fn start_text_turn(mcp: &mut TestAppServer, thread_id: String) -> Result<(
     Ok(())
 }
 
+async fn initialize_as_codex_desktop(mcp: &mut TestAppServer) -> Result<()> {
+    let initialized = mcp
+        .initialize_with_client_info(ClientInfo {
+            name: "Codex Desktop".to_string(),
+            title: Some("Codex Desktop".to_string()),
+            version: "test".to_string(),
+        })
+        .await?;
+    match initialized {
+        JSONRPCMessage::Response(_) => Ok(()),
+        other => anyhow::bail!("expected initialize response, got {other:?}"),
+    }
+}
+
 async fn start_thread(mcp: &mut TestAppServer) -> Result<ThreadStartResponse> {
+    start_thread_with_model(mcp, "mock-model").await
+}
+
+async fn start_thread_with_model(
+    mcp: &mut TestAppServer,
+    model: &str,
+) -> Result<ThreadStartResponse> {
     let request_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
-            model: Some("mock-model".to_string()),
+            model: Some(model.to_string()),
             ..Default::default()
         })
         .await?;

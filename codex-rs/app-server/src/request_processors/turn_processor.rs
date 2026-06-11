@@ -518,6 +518,7 @@ impl TurnRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let ignore_turn_start_effort = app_server_client_name.as_deref() == Some("Codex Desktop");
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
                 .await
@@ -627,7 +628,15 @@ impl TurnRequestProcessor {
                     permissions: params.permissions,
                     model: params.model,
                     service_tier: params.service_tier,
-                    effort: params.effort,
+                    // Codex Desktop persists explicit thinking-level changes via
+                    // `thread/settings/update`. The composer can still include a stale
+                    // `turn/start.effort` after switching threads, so do not let that
+                    // field overwrite the thread's saved setting for Desktop turns.
+                    effort: if ignore_turn_start_effort {
+                        None
+                    } else {
+                        params.effort
+                    },
                     summary: params.summary,
                     collaboration_mode: params.collaboration_mode,
                     personality: params.personality,
